@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Congen Commands Manual</title>
+<style>
+  :root {
+    --bg:     #0f1117;
+    --surface:#1a1d27;
+    --card:   #21253a;
+    --border: #2e3354;
+    --accent: #6c8bff;
+    --green:  #4ade80;
+    --yellow: #facc15;
+    --text:   #e2e8f0;
+    --dim:    #8892a4;
+    --code-bg:#111827;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+    font-size: 15px;
+    line-height: 1.6;
+    padding: 40px 20px;
+  }
+  .wrapper { max-width: 900px; margin: 0 auto; }
+
+  /* ── Cover ── */
+  .cover {
+    background: linear-gradient(135deg, #1a1d27 0%, #0f1117 100%);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 48px 40px;
+    text-align: center;
+    margin-bottom: 40px;
+    position: relative;
+    overflow: hidden;
+  }
+  .cover::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: radial-gradient(ellipse at 50% 0%, rgba(108,139,255,.15) 0%, transparent 70%);
+  }
+  .cover-logo {
+    font-size: 13px;
+    font-family: monospace;
+    color: var(--accent);
+    white-space: pre;
+    line-height: 1.3;
+    margin-bottom: 24px;
+  }
+  .cover h1 { font-size: 28px; color: var(--text); font-weight: 700; margin-bottom: 8px; }
+  .cover .subtitle { color: var(--dim); font-size: 14px; }
+  .cover .stats {
+    display: flex;
+    justify-content: center;
+    gap: 32px;
+    margin-top: 28px;
+  }
+  .stat-box {
+    background: rgba(108,139,255,.08);
+    border: 1px solid rgba(108,139,255,.2);
+    border-radius: 10px;
+    padding: 12px 24px;
+  }
+  .stat-box .val { font-size: 28px; font-weight: 700; color: var(--yellow); }
+  .stat-box .lbl { font-size: 12px; color: var(--dim); text-transform: uppercase; letter-spacing: .06em; }
+
+  /* ── Section header ── */
+  .section-title {
+    font-size: 13px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: .1em;
+    color: var(--accent);
+    margin: 36px 0 16px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  /* ── Cards ── */
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    margin-bottom: 20px;
+    overflow: hidden;
+    transition: border-color .2s;
+  }
+  .card:hover { border-color: var(--accent); }
+  .card-header {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    background: var(--surface);
+    padding: 14px 20px;
+    border-bottom: 1px solid var(--border);
+  }
+  .num {
+    background: var(--accent);
+    color: #000;
+    font-size: 11px;
+    font-weight: 700;
+    padding: 3px 8px;
+    border-radius: 6px;
+    letter-spacing: .05em;
+  }
+  .cmd-name { font-size: 17px; font-weight: 700; color: var(--text); }
+  .info-table { width: 100%; border-collapse: collapse; }
+  .info-table tr { border-bottom: 1px solid var(--border); }
+  .info-table tr:last-child { border-bottom: none; }
+  .info-table th {
+    width: 140px;
+    padding: 11px 20px;
+    text-align: left;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--dim);
+    text-transform: uppercase;
+    letter-spacing: .06em;
+    white-space: nowrap;
+  }
+  .info-table td { padding: 11px 20px; color: var(--text); }
+  .info-table code {
+    background: var(--code-bg);
+    color: var(--green);
+    font-family: "Cascadia Code", "Fira Code", monospace;
+    font-size: 13px;
+    padding: 2px 8px;
+    border-radius: 5px;
+    word-break: break-all;
+  }
+
+  .empty { color: var(--dim); font-style: italic; padding: 20px 0; }
+
+  /* ── Footer ── */
+  footer {
+    margin-top: 48px;
+    padding-top: 20px;
+    border-top: 1px solid var(--border);
+    text-align: center;
+    color: var(--dim);
+    font-size: 13px;
+  }
+  footer span { color: var(--accent); font-weight: 600; }
+
+  @media print {
+    body { background: #fff; color: #000; padding: 20px; }
+    .cover { background: #f5f5f5; border: 2px solid #333; }
+    .cover-logo { color: #333; }
+    .cover h1 { color: #000; }
+    .card { border: 1px solid #ccc; break-inside: avoid; }
+    .card-header { background: #eee; }
+    .cmd-name { color: #000; }
+    .info-table code { background: #f0f0f0; color: #006400; }
+    footer { border-top: 1px solid #ccc; }
+  }
+</style>
+</head>
+<body>
+<div class="wrapper">
+
+  <div class="cover">
+    <div class="cover-logo">
+ ██████╗ ██████╗ ███╗   ██╗ ██████╗ ███████╗███╗   ██╗
+██╔════╝██╔═══██╗████╗  ██║██╔════╝ ██╔════╝████╗  ██║
+██║     ██║   ██║██╔██╗ ██║██║  ███╗█████╗  ██╔██╗ ██║
+██║     ██║   ██║██║╚██╗██║██║   ██║██╔══╝  ██║╚██╗██║
+╚██████╗╚██████╔╝██║ ╚████║╚██████╔╝███████╗██║ ╚████║
+ ╚═════╝ ╚═════╝ ╚═╝  ╚═══╝ ╚═════╝ ╚══════╝╚═╝  ╚═══╝</div>
+    <h1>KDE Connect Commands Manual</h1>
+    <p class="subtitle">Generated by <strong>Congen v1.0.0</strong> &nbsp;·&nbsp; 2026-09-19 23:37:50</p>
+    <div class="stats">
+      <div class="stat-box">
+        <div class="val">1</div>
+        <div class="lbl">Commands Installed</div>
+      </div>
+      <div class="stat-box">
+        <div class="val">2</div>
+        <div class="lbl">In This Manual</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="section-title">Registered KDE Connect Commands</div>
+
+  
+    <div class="card">
+      <div class="card-header">
+        <span class="num">#1</span>
+        <span class="cmd-name">The label shown in the KDE Connect app</span>
+      </div>
+      <table class="info-table">
+        <tr><th>Script Path</th><td><code>Full path to the Bash script executed</code></td></tr>
+        <tr><th>Summary</th>    <td>Brief description of what the command does</td></tr>
+        <tr><th>Date Added</th> <td>Date/time the command was registered</td></tr>
+      </table>
+    </div>
+    <div class="card">
+      <div class="card-header">
+        <span class="num">#2</span>
+        <span class="cmd-name">Open_Mix_Archive_Manager</span>
+      </div>
+      <table class="info-table">
+        <tr><th>Script Path</th><td><code>/home/mplanetarian/Documents/BASH_SCRIPTS/manager.sh</code></td></tr>
+        <tr><th>Summary</th>    <td>Opens the Mix Archive Manager</td></tr>
+        <tr><th>Date Added</th> <td>2026-09-19 23:34:38</td></tr>
+      </table>
+    </div>
+
+  <footer>
+    Generated by <span>Congen v1.0.0</span> &nbsp;·&nbsp;
+    Script directory: <code style="color:inherit">/var/home/mplanetarian/Documents/BASH_SCRIPTS</code> &nbsp;·&nbsp;
+    2026-09-19 23:37:50
+  </footer>
+
+</div>
+</body>
+</html>

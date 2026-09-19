@@ -1,0 +1,9 @@
+────────────────────────────────────────────────────────────────────────────────
+  Job ID     : congen-job-20260919_233701
+  Backend    : systemd-run
+  Scheduled  : 2026-09-19 23:38
+  Commands   : Open_Mix_Archive_Manager
+  Job Script : /var/home/mplanetarian/Documents/BASH_SCRIPTS/.congen_jobs/job_20260919_233701.sh
+  Created    : 2026-09-19 23:37:01
+────────────────────────────────────────────────────────────────────────────────
+
