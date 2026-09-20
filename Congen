@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  Congen - KDE Connect Commands Generator
-#  Filename : Congen.sh
-#  Author   : Generated for mplanetarian
+#  Filename : Congen
+#  Author   : MPlanetarian
 #  Version  : 1.0.0
 #  Created  : 2026-09-19
 #  Purpose  : Interactively create and register KDE Connect run-commands,
@@ -452,7 +452,10 @@ show_banner() {
 pick_device_config_dir() {
     local -a device_dirs=()
     while IFS= read -r -d '' d; do
-        device_dirs+=("$d")
+        local bname="$(basename "${d}")"
+        if [[ -f "${d}/config" && "${bname}" != "backups" && ! "${bname}" =~ ^kdeconnect_ ]]; then
+            device_dirs+=("$d")
+        fi
     done < <(find "${KDECONNECT_CFG_DIR}" -mindepth 1 -maxdepth 1 \
                   -type d -not -name "." -print0 2>/dev/null)
 
@@ -517,54 +520,131 @@ read_commands_from_config() {
 # Write / update a command entry in the plugin config INI
 # ---------------------------------------------------------------------------
 write_command_to_config() {
-    local cfg="$1"    # full path to plugin "config" file
-    local key="$2"    # e.g. "cmd0"
+    local cfg="$1"     # full path to plugin "config" file
+    local key="$2"     # e.g. "cmd0"
     local name="$3"
     local script="$4"
 
-    # Ensure [commands] section exists
-    if [[ ! -f "${cfg}" ]]; then
-        printf '[commands]\n' > "${cfg}"
-    fi
+    mkdir -p "$(dirname "${cfg}")"
 
-    if ! grep -q '^\[commands\]' "${cfg}"; then
-        printf '\n[commands]\n' >> "${cfg}"
-    fi
+    # Ensure config file exists
+    [[ ! -f "${cfg}" ]] && touch "${cfg}"
 
-    # Build the two lines to insert/update
-    local name_key="${key}\\name"
-    local cmd_key="${key}\\command"
-
-    # Use python3 (available on virtually all modern Linux desktops) to handle
-    # the KDE INI quirk of backslash-escaped sub-keys safely.
     python3 - "${cfg}" "${key}" "${name}" "${script}" <<'PYEOF'
-import sys, re, os
+import sys, os, re, json, uuid
 
 cfg_path, key, name, script = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+clean_script = script.replace("\r", "").replace("\n", "").strip()
 
-with open(cfg_path, 'r') as f:
-    content = f.read()
+lines = []
+if os.path.isfile(cfg_path):
+    try:
+        with open(cfg_path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+    except Exception:
+        lines = []
 
-# Locate or create the [commands] section
-section_re = re.compile(r'(\[commands\])(.*?)(?=\n\[|\Z)', re.DOTALL | re.IGNORECASE)
-m = section_re.search(content)
+# -------------------------------------------------------------------
+# 1. Update or Initialize the modern @ByteArray JSON payload
+# -------------------------------------------------------------------
+json_dict = {}
+commands_line_idx = -1
 
-name_line   = f'{key}\\name={name}'
-cmd_line    = f'{key}\\command={script}'
+for idx, line in enumerate(lines):
+    l_strip = line.strip()
+    if l_strip.startswith("commands="):
+        commands_line_idx = idx
+        raw = l_strip[len("commands="):].strip()
+        if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
+            raw = raw[1:-1].strip()
+        if raw.startswith("@ByteArray(") and raw.endswith(")"):
+            raw = raw[len("@ByteArray("):-1].strip()
+        if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
+            raw = raw[1:-1].strip()
+        if r'\"' in raw:
+            raw = raw.replace(r'\"', '"')
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, str):
+                parsed = json.loads(parsed)
+            if isinstance(parsed, dict):
+                json_dict = parsed
+        except Exception:
+            pass
+        break
 
-if m:
-    body = m.group(2)
-    # Remove existing entry for this key (if re-running)
-    body = re.sub(rf'^{re.escape(key)}\\\\name=.*\n?', '', body, flags=re.MULTILINE)
-    body = re.sub(rf'^{re.escape(key)}\\\\command=.*\n?', '', body, flags=re.MULTILINE)
-    body = body.rstrip('\n') + f'\n{name_line}\n{cmd_line}\n'
-    new_section = m.group(1) + body
-    content = content[:m.start()] + new_section + content[m.end():]
+# Match existing command by name to update, or create a new UUID entry
+found_uuid = None
+for u, entry in json_dict.items():
+    if isinstance(entry, dict) and entry.get("name") == name:
+        found_uuid = u
+        break
+
+if not found_uuid:
+    found_uuid = str(uuid.uuid4()).replace("-", "_")
+
+json_dict[found_uuid] = {
+    "name": name,
+    "command": clean_script
+}
+
+compact_json = json.dumps(json_dict, separators=(',', ':'))
+escaped_json = compact_json.replace('"', '\\"')
+new_bytearray_line = f'commands="@ByteArray({escaped_json})"\n'
+
+has_general = any(l.strip() == "[General]" for l in lines)
+
+if commands_line_idx != -1:
+    lines[commands_line_idx] = new_bytearray_line
+    if not has_general:
+        lines.insert(commands_line_idx, "[General]\n")
 else:
-    content += f'\n[commands]\n{name_line}\n{cmd_line}\n'
+    if not has_general:
+        lines.insert(0, "[General]\n")
+        lines.insert(1, new_bytearray_line)
+    else:
+        gen_idx = next(i for i, l in enumerate(lines) if l.strip() == "[General]")
+        lines.insert(gen_idx + 1, new_bytearray_line)
 
-with open(cfg_path, 'w') as f:
-    f.write(content)
+# -------------------------------------------------------------------
+# 2. Update the legacy INI [commands] section
+# -------------------------------------------------------------------
+has_commands_section = any(l.strip() == "[commands]" for l in lines)
+if not has_commands_section:
+    if lines and not lines[-1].endswith("\n"):
+        lines[-1] += "\n"
+    lines.append("\n[commands]\n")
+
+name_pattern = re.compile(rf"^{re.escape(key)}\\name=.*$")
+cmd_pattern = re.compile(rf"^{re.escape(key)}\\command=.*$")
+
+name_written = False
+cmd_written = False
+
+for idx, line in enumerate(lines):
+    if name_pattern.match(line.strip()):
+        lines[idx] = f"{key}\\name={name}\n"
+        name_written = True
+    elif cmd_pattern.match(line.strip()):
+        lines[idx] = f"{key}\\command={clean_script}\n"
+        cmd_written = True
+
+if not name_written or not cmd_written:
+    cmd_sec_idx = -1
+    for idx, line in enumerate(lines):
+        if line.strip() == "[commands]":
+            cmd_sec_idx = idx
+            break
+
+    insert_pos = len(lines) if cmd_sec_idx == -1 else cmd_sec_idx + 1
+    if not name_written:
+        lines.insert(insert_pos, f"{key}\\name={name}\n")
+        insert_pos += 1
+    if not cmd_written:
+        lines.insert(insert_pos, f"{key}\\command={clean_script}\n")
+
+with open(cfg_path, "w", encoding="utf-8") as f:
+    f.writelines(lines)
 PYEOF
 }
 
@@ -685,7 +765,7 @@ create_command() {
     local cmd_name=""
     while [[ -z "${cmd_name}" ]]; do
         read -rp "  $(echo -e "${BOLD}Command Name${RESET} (label shown in KDE Connect app): ")" cmd_name
-        cmd_name="${cmd_name// /_}"   # replace spaces with underscores for safety
+        cmd_name="$(echo "${cmd_name}" | xargs)"
         [[ -z "${cmd_name}" ]] && echo -e "  ${RED}Command name cannot be empty.${RESET}"
     done
 
@@ -720,6 +800,7 @@ create_command() {
     local summary=""
     while [[ -z "${summary}" ]]; do
         read -rp "  $(echo -e "${BOLD}Brief Summary${RESET} of what this command does: ")" summary
+        summary="$(echo "${summary}" | xargs)"
         [[ -z "${summary}" ]] && echo -e "  ${RED}Summary cannot be empty.${RESET}"
     done
 
@@ -731,7 +812,8 @@ create_command() {
 
     local cfg_file="${plugin_dir}/config"
     local cmd_key
-    cmd_key=$(next_command_key "${cfg_file}")
+    cmd_key=$(next_command_key "${cfg_file}") || true
+    [[ -z "${cmd_key}" ]] && cmd_key="cmd0"
 
     # Derive device name from parent directory name for display
     local device_id device_name
@@ -747,24 +829,38 @@ create_command() {
     echo ""
     echo -e "  ${DIM}Writing command '${cmd_name}' → ${cfg_file}${RESET}"
 
-    # 5. Write to plugin config
+    # 5. Write to plugin config (dual @ByteArray + INI format)
     write_command_to_config "${cfg_file}" "${cmd_key}" "${cmd_name}" "${script_path}"
 
     # 6. Update manual
-    update_manual "${cmd_name}" "${script_path}" "${summary}"
+    if declare -F update_manual &>/dev/null; then
+        update_manual "${cmd_name}" "${script_path}" "${summary}" || true
+    fi
 
     # 7. Log the action
-    log_entry "CREATED command '${cmd_name}' | script='${script_path}' | device='${device_name}' | key='${cmd_key}'"
-
-    # 8. Ask KDE Connect daemon to reload (best-effort)
-    if command -v qdbus &>/dev/null; then
-        qdbus org.kde.kdeconnect /modules/kdeconnect \
-              org.kde.kdeconnect.daemon.refreshDiscovery 2>/dev/null || true
+    if declare -F log_entry &>/dev/null; then
+        log_entry "CREATED command '${cmd_name}' | script='${script_path}' | device='${device_name}' | key='${cmd_key}'" || true
     fi
-    # Plasma 6 / kdeconnect-kde ≥ 23.x
+
+    # 8. Reload KDE Connect daemon and device runcommand plugin over D-Bus
+    local qdbus_bin=""
     if command -v qdbus6 &>/dev/null; then
-        qdbus6 org.kde.kdeconnect /modules/kdeconnect \
-               org.kde.kdeconnect.daemon.refreshDiscovery 2>/dev/null || true
+        qdbus_bin="qdbus6"
+    elif command -v qdbus &>/dev/null; then
+        qdbus_bin="qdbus"
+    fi
+
+    if [[ -n "${qdbus_bin}" ]]; then
+        # Reload specific device plugin stack
+        if [[ -n "${device_id:-}" ]]; then
+            "${qdbus_bin}" org.kde.kdeconnect "/modules/kdeconnect/devices/${device_id}/runcommand" \
+                org.kde.kdeconnect.device.runcommand.reload &>/dev/null || true
+            "${qdbus_bin}" org.kde.kdeconnect "/modules/kdeconnect/devices/${device_id}" \
+                org.kde.kdeconnect.device.reloadPlugins &>/dev/null || true
+        fi
+        # Broadcast network state change across all paired peers
+        "${qdbus_bin}" org.kde.kdeconnect /modules/kdeconnect \
+            org.kde.kdeconnect.daemon.forceOnNetworkChange &>/dev/null || true
     fi
 
     # 9. Display post-install summary
@@ -1293,7 +1389,7 @@ import_commands() {
     local -a congen_files=()
     while IFS= read -r -d '' f; do
         congen_files+=("$f")
-    done < <(find "${import_dir}" -maxdepth 2 -name "*.congen" -print0 2>/dev/null)
+    done < <(find "${import_dir}" -maxdepth 2 -name "*.congen" -print0 2>/dev/null || true)
 
     if [[ ${#congen_files[@]} -eq 0 ]]; then
         echo -e "  ${RED}No .congen files found in:${RESET}"
@@ -1314,9 +1410,8 @@ import_commands() {
     for (( fi=0; fi<${#congen_files[@]}; fi++ )); do
         local fname
         fname="$(basename "${congen_files[$fi]}")"
-        # Read name field from the file
         local imp_name
-        imp_name=$(grep '^name=' "${congen_files[$fi]}" 2>/dev/null | head -1 | cut -d'=' -f2-)
+        imp_name=$(grep '^name=' "${congen_files[$fi]}" 2>/dev/null | head -1 | cut -d'=' -f2- || true)
         printf "    ${YELLOW}[%d]${RESET}  %-30s  ${DIM}Command: %s${RESET}\n" \
                "$(( fi+1 ))" "${fname}" "${imp_name:-unknown}"
     done
@@ -1351,65 +1446,108 @@ import_commands() {
     local -a imported_names=() skipped_names=()
 
     for congen_file in "${congen_files[@]}"; do
-        # Parse fields
+        # Parse fields safely
         local imp_name imp_script imp_summary imp_added
-        imp_name=$(   grep '^name='    "${congen_file}" 2>/dev/null | head -1 | cut -d'=' -f2-)
-        imp_script=$( grep '^script='  "${congen_file}" 2>/dev/null | head -1 | cut -d'=' -f2-)
-        imp_summary=$(grep '^summary=' "${congen_file}" 2>/dev/null | head -1 | cut -d'=' -f2-)
-        imp_added=$(  grep '^added='   "${congen_file}" 2>/dev/null | head -1 | cut -d'=' -f2-)
+        imp_name=$(grep '^name=' "${congen_file}" 2>/dev/null | head -1 | cut -d'=' -f2- || true)
+        imp_script=$(grep '^script=' "${congen_file}" 2>/dev/null | head -1 | cut -d'=' -f2- || true)
+        imp_summary=$(grep '^summary=' "${congen_file}" 2>/dev/null | head -1 | cut -d'=' -f2- || true)
+        imp_added=$(grep '^added=' "${congen_file}" 2>/dev/null | head -1 | cut -d'=' -f2- || true)
 
         if [[ -z "${imp_name}" || -z "${imp_script}" ]]; then
             echo -e "  ${YELLOW}⚠  Skipping malformed file:${RESET} $(basename "${congen_file}")"
-            (( skipped++ ))
+            skipped=$(( skipped + 1 ))
             skipped_names+=("$(basename "${congen_file}")")
+            continue
+        fi
+
+        # Check if identical command already exists in target config
+        local already_exists=0
+        if [[ -f "${cfg_file}" ]]; then
+            while IFS= read -r existing_script; do
+                local clean_existing clean_imp
+                clean_existing=$(echo "${existing_script}" | sed -e 's/\\n//g' -e 's/\r//g' | xargs)
+                clean_imp=$(echo "${imp_script}" | sed -e 's/\\n//g' -e 's/\r//g' | xargs)
+                if [[ "${clean_existing}" == "${clean_imp}" ]]; then
+                    already_exists=1
+                    break
+                fi
+            done < <(grep -E '^cmd[0-9]+\\command=' "${cfg_file}" 2>/dev/null | cut -d'=' -f2- || true)
+        fi
+
+        if (( already_exists == 1 )); then
+            printf "    ${DIM}•  Already registered: %s (skipped)${RESET}\n" "${imp_name}"
+            skipped=$(( skipped + 1 ))
+            skipped_names+=("${imp_name} (already exists)")
             continue
         fi
 
         # Get next available key
         local cmd_key
-        cmd_key=$(next_command_key "${cfg_file}")
-
-        # Write to KDE config
-        write_command_to_config "${cfg_file}" "${cmd_key}" "${imp_name}" "${imp_script}"
-
-        # Write to manual (only if not already in it)
-        local existing_summary
-        existing_summary=$(lookup_summary_from_manual "${imp_name}")
-        if [[ "${existing_summary}" == "—" ]]; then
-            update_manual "${imp_name}" "${imp_script}" "${imp_summary:-Imported via Congen}"
+        cmd_key=$(next_command_key "${cfg_file}") || true
+        if [[ -z "${cmd_key}" ]]; then
+            cmd_key="cmd$(( imported + 1 ))"
         fi
 
-        log_entry "IMPORTED command '${imp_name}' | script='${imp_script}' | device='${device_name}' | key='${cmd_key}'"
+        # Write to KDE config
+        write_command_to_config "${cfg_file}" "${cmd_key}" "${imp_name}" "${imp_script}" || true
+
+        # Write to manual (only if not already in it)
+        local existing_summary="—"
+        if declare -F lookup_summary_from_manual &>/dev/null; then
+            existing_summary=$(lookup_summary_from_manual "${imp_name}" 2>/dev/null || echo "—")
+        fi
+
+        if [[ "${existing_summary}" == "—" ]] && declare -F update_manual &>/dev/null; then
+            update_manual "${imp_name}" "${imp_script}" "${imp_summary:-Imported via Congen}" || true
+        fi
+
+        if declare -F log_entry &>/dev/null; then
+            log_entry "IMPORTED command '${imp_name}' | script='${imp_script}' | device='${device_name}' | key='${cmd_key}'" || true
+        fi
 
         printf "    ${GREEN}✔${RESET}  Imported: ${BOLD}%s${RESET} → %s\n" \
                "${imp_name}" "${cmd_key}"
 
         imported_names+=("${imp_name}")
-        (( imported++ ))
+        imported=$(( imported + 1 ))
     done
 
-    # Signal daemon to reload
-    if command -v qdbus &>/dev/null; then
-        qdbus org.kde.kdeconnect /modules/kdeconnect \
-              org.kde.kdeconnect.daemon.refreshDiscovery 2>/dev/null || true
-    fi
+# Signal daemon / device to reload commands
+    local qdbus_bin=""
     if command -v qdbus6 &>/dev/null; then
-        qdbus6 org.kde.kdeconnect /modules/kdeconnect \
-               org.kde.kdeconnect.daemon.refreshDiscovery 2>/dev/null || true
+        qdbus_bin="qdbus6"
+    elif command -v qdbus &>/dev/null; then
+        qdbus_bin="qdbus"
+    fi
+
+    if [[ -n "${qdbus_bin}" ]]; then
+        # 1. Plasma 6 daemon-level discovery/network trigger
+        "${qdbus_bin}" org.kde.kdeconnect /modules/kdeconnect \
+            org.kde.kdeconnect.daemon.forceOnNetworkChange &>/dev/null || true
+
+        # 2. Targeted device plugin reload (reloads runcommand config immediately)
+        if [[ -n "${device_id:-}" ]]; then
+            "${qdbus_bin}" org.kde.kdeconnect "/modules/kdeconnect/devices/${device_id}" \
+                org.kde.kdeconnect.device.reloadPlugins &>/dev/null || true
+            "${qdbus_bin}" org.kde.kdeconnect "/modules/kdeconnect/devices/${device_id}/runcommand" \
+                org.kde.kdeconnect.device.runcommand.reload &>/dev/null || true
+        fi
     fi
 
     # Write summary to log
-    {
-        echo "========================================"
-        echo "  Congen Import Summary"
-        echo "  Timestamp      : $(date '+%Y-%m-%d %H:%M:%S')"
-        echo "  Target Device  : ${device_name}"
-        echo "  Total Imported : ${imported}"
-        echo "  Total Skipped  : ${skipped}"
-        for n in "${imported_names[@]}"; do echo "  ✔ ${n}"; done
-        for n in "${skipped_names[@]}";  do echo "  ✘ ${n} (skipped)"; done
-        echo "========================================"
-    } >> "${LOG_FILE}"
+    if [[ -n "${LOG_FILE:-}" ]]; then
+        {
+            echo "========================================"
+            echo "  Congen Import Summary"
+            echo "  Timestamp      : $(date '+%Y-%m-%d %H:%M:%S')"
+            echo "  Target Device  : ${device_name}"
+            echo "  Total Imported : ${imported}"
+            echo "  Total Skipped  : ${skipped}"
+            for n in "${imported_names[@]}"; do echo "  ✔ ${n}"; done
+            for n in "${skipped_names[@]}";  do echo "  ✘ ${n} (skipped)"; done
+            echo "========================================"
+        } >> "${LOG_FILE}" 2>/dev/null || true
+    fi
 
     echo ""
     echo -e "${CYAN}$(hr '─')${RESET}"
@@ -1424,44 +1562,252 @@ import_commands() {
 }
 
 # ---------------------------------------------------------------------------
-# Congen Management submenu
+    # Congen Management submenu
+    # ---------------------------------------------------------------------------
+    congen_management() {
+        while true; do
+            clear
+            echo ""
+            echo -e "${CYAN}$(hr '═')${RESET}"
+            echo -e "${CYAN}║${RESET}  ${BOLD}${WHITE}Congen Management${RESET}"
+            echo -e "${CYAN}$(hr '═')${RESET}"
+            echo ""
+            echo -e "  ${BOLD}What would you like to do?${RESET}"
+            echo ""
+            echo -e "    ${YELLOW}[1]${RESET}  Export KDE Connect commands"
+            echo -e "         ${DIM}Save all installed commands to CONGEN_EXPORT/ as .congen files${RESET}"
+            echo ""
+            echo -e "    ${YELLOW}[2]${RESET}  Register KDE Connect commands inside  Congen"
+            echo -e "         ${DIM}Load .congen files from CONGEN_IMPORT/ and register them${RESET}"
+            echo ""
+            echo -e "    ${YELLOW}[3]${RESET}  Import Existing KDE Connect commands"
+            echo -e "         ${DIM}Brings your existing commands in to Congen (From All Registered Devices - Deuplicated)${RESET}"
+            echo -e "         ${DIM}NOTE: After Importing you need to Register them with Congen using Option 2${RESET}"
+            echo ""
+            echo -e "    ${YELLOW}[b]${RESET}  Back to Main Menu"
+            echo ""
+
+            echo -e "  ${DIM}Import dir  : ${SCRIPT_DIR}/CONGEN_IMPORT/${RESET}"
+            echo -e "  ${DIM}Export base : ${SCRIPT_DIR}/CONGEN_EXPORT/<timestamp>/${RESET}"
+            echo ""
+
+            local opt
+            read -rp "  $(echo -e "${BOLD}Select option: ${RESET}")" opt
+
+            case "${opt,,}" in
+                1) export_commands ;;
+                2) import_commands ;;
+                3) import_existing_kdeconnect_commands ;;
+                b|back) return ;;
+                *)
+                    echo -e "\n  ${RED}Invalid option.${RESET} Please select 1, 2, 3 or b."
+                    sleep 1
+                    ;;
+            esac
+        done
+    }
+
 # ---------------------------------------------------------------------------
-congen_management() {
-    while true; do
-        clear
-        echo ""
-        echo -e "${CYAN}$(hr '═')${RESET}"
-        echo -e "${CYAN}║${RESET}  ${BOLD}${WHITE}Congen Management${RESET}"
-        echo -e "${CYAN}$(hr '═')${RESET}"
-        echo ""
-        echo -e "  ${BOLD}What would you like to do?${RESET}"
-        echo ""
-        echo -e "    ${YELLOW}[1]${RESET}  Export KDE Connect commands"
-        echo -e "         ${DIM}Save all installed commands to CONGEN_EXPORT/ as .congen files${RESET}"
-        echo ""
-        echo -e "    ${YELLOW}[2]${RESET}  Import KDE Connect commands"
-        echo -e "         ${DIM}Load .congen files from CONGEN_IMPORT/ and register them${RESET}"
-        echo ""
-        echo -e "    ${YELLOW}[b]${RESET}  Back to Main Menu"
-        echo ""
+# Import Existing KDE Commands from the System (With Deduplication Support)
+# ---------------------------------------------------------------------------
+import_existing_kdeconnect_commands() {
+    local kdeconnect_dir="${HOME}/.config/kdeconnect"
+    local import_dir="${CONGEN_IMPORT_DIR:-${SCRIPT_DIR}/CONGEN_IMPORT}"
 
-        echo -e "  ${DIM}Import dir  : ${SCRIPT_DIR}/CONGEN_IMPORT/${RESET}"
-        echo -e "  ${DIM}Export base : ${SCRIPT_DIR}/CONGEN_EXPORT/<timestamp>/${RESET}"
-        echo ""
+    if [[ ! -d "${kdeconnect_dir}" ]]; then
+        echo -e "\n[!] KDE Connect configuration directory not found at: ${kdeconnect_dir}"
+        read -r -p "Press Enter to return..."
+        return 0
+    fi
 
-        local opt
-        read -rp "  $(echo -e "${BOLD}Select option: ${RESET}")" opt
+    mkdir -p "${import_dir}"
+    echo -e "\n[*] Scanning for existing KDE Connect commands across devices..."
 
-        case "${opt,,}" in
-            1) export_commands ;;
-            2) import_commands ;;
-            b|back) return ;;
-            *)
-                echo -e "\n  ${RED}Invalid option.${RESET} Please select 1, 2 or b."
-                sleep 1
-                ;;
-        esac
-    done
+    python3 - "${kdeconnect_dir}" "${import_dir}" << 'EOF'
+import sys
+import os
+import re
+import json
+import hashlib
+from datetime import datetime
+
+kdeconnect_dir = sys.argv[1]
+import_dir = sys.argv[2]
+
+count = 0
+dupe_count = 0
+
+seen_signatures = set()
+seen_filenames = set()
+
+# Index existing .congen files in import_dir
+if os.path.isdir(import_dir):
+    for f in os.listdir(import_dir):
+        if f.endswith(".congen"):
+            seen_filenames.add(f)
+
+# Find all device subdirectories
+dev_dirs = [os.path.join(kdeconnect_dir, d) for d in os.listdir(kdeconnect_dir)
+            if os.path.isdir(os.path.join(kdeconnect_dir, d))]
+
+for dev_dir in dev_dirs:
+    # Resolve friendly device name
+    dev_config = os.path.join(dev_dir, "config")
+    device_name = os.path.basename(dev_dir)
+    if os.path.isfile(dev_config):
+        try:
+            with open(dev_config, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    if line.startswith("name="):
+                        val = line.split("=", 1)[1].strip()
+                        if val:
+                            device_name = val
+                        break
+        except Exception:
+            pass
+
+    # Collect config and backup files in kdeconnect_runcommand
+    runcmd_dir = os.path.join(dev_dir, "kdeconnect_runcommand")
+    if not os.path.isdir(runcmd_dir):
+        continue
+
+    runcmd_files = []
+    for fname in os.listdir(runcmd_dir):
+        if fname == "config" or fname.startswith("config.bak"):
+            runcmd_files.append(os.path.join(runcmd_dir, fname))
+
+    # Process newest/active config files first
+    runcmd_files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+
+    for rfile in runcmd_files:
+        try:
+            with open(rfile, "r", encoding="utf-8", errors="ignore") as f:
+                lines = f.readlines()
+        except Exception:
+            continue
+
+        for line in lines:
+            line = line.strip()
+            if not line.startswith("commands="):
+                continue
+
+            raw = line[len("commands="):].strip()
+
+            # Strip outer single or double quotes
+            if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
+                raw = raw[1:-1].strip()
+
+            # Strip @ByteArray(...) wrapper
+            if raw.startswith("@ByteArray(") and raw.endswith(")"):
+                raw = raw[len("@ByteArray("):-1].strip()
+
+            # Second quote strip if inner string was quoted
+            if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
+                raw = raw[1:-1].strip()
+
+            # Unescape \" if JSON string was escaped
+            if r'\"' in raw:
+                raw = raw.replace(r'\"', '"')
+
+            data = None
+            try:
+                data = json.loads(raw)
+            except Exception:
+                pass
+
+            # Handle second-level string decode if double-serialized
+            if isinstance(data, str):
+                try:
+                    data = json.loads(data)
+                except Exception:
+                    data = None
+
+            if not isinstance(data, dict):
+                continue
+
+            for key, val in data.items():
+                if not isinstance(val, dict):
+                    continue
+
+                cmd_name = val.get("name", "").strip()
+                cmd_exec = val.get("command", "").strip()
+
+                if not cmd_name or not cmd_exec:
+                    continue
+
+                # Strip trailing newlines or carriage returns from commands
+                cmd_exec = cmd_exec.replace("\\n", "").replace("\r", "").replace("\n", "").strip()
+
+                # Deduplicate identical name + script definitions
+                sig = hashlib.sha256(f"{cmd_name}\0{cmd_exec}".encode("utf-8")).hexdigest()
+                if sig in seen_signatures:
+                    dupe_count += 1
+                    continue
+                seen_signatures.add(sig)
+
+                # Generate clean filename
+                safe_name = re.sub(r"[ /]", "_", cmd_name)
+                safe_name = re.sub(r"[^a-zA-Z0-9_\-]", "", safe_name)
+                if not safe_name:
+                    safe_name = f"kde_cmd_{key}"
+
+                final_name = f"{safe_name}.congen"
+                idx = 1
+                skip_item = False
+
+                while final_name in seen_filenames:
+                    target_path = os.path.join(import_dir, final_name)
+                    if os.path.isfile(target_path):
+                        try:
+                            with open(target_path, "r", encoding="utf-8", errors="ignore") as f:
+                                for tline in f:
+                                    if tline.startswith("script="):
+                                        if tline.split("=", 1)[1].strip() == cmd_exec:
+                                            dupe_count += 1
+                                            skip_item = True
+                                            break
+                        except Exception:
+                            pass
+                    if skip_item:
+                        break
+                    final_name = f"{safe_name}_{idx}.congen"
+                    idx += 1
+
+                if skip_item:
+                    continue
+
+                seen_filenames.add(final_name)
+                target_congen = os.path.join(import_dir, final_name)
+                now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                congen_content = (
+                    "# Congen Export File\n"
+                    "# Imported via Congen Legacy Discovery\n"
+                    f"# Exported : {now_str}\n"
+                    "[command]\n"
+                    f"name={cmd_name}\n"
+                    f"script={cmd_exec}\n"
+                    f"device={device_name}\n"
+                    f"config_key={key}\n"
+                    f"summary={cmd_name} (Imported from {device_name})\n"
+                    f"added={now_str}\n"
+                )
+
+                try:
+                    with open(target_congen, "w", encoding="utf-8") as out:
+                        out.write(congen_content)
+                    print(f'  [+] Imported: {final_name} ("{cmd_name}" from {device_name})')
+                    count += 1
+                except Exception as e:
+                    print(f'  [-] Error writing {final_name}: {e}')
+
+print(f"\n[✓] Successfully imported {count} unique legacy command(s) into {import_dir}")
+if dupe_count > 0:
+    print(f"[i] Deduplicated {dupe_count} duplicate command instance(s) found across backups.")
+EOF
+
+    echo ""
+    read -r -p "Press Enter to return..."
 }
 
 # ---------------------------------------------------------------------------
