@@ -66,24 +66,51 @@ press_enter() {
 # Count currently registered KDE Connect run-commands
 # ---------------------------------------------------------------------------
 count_kdeconnect_commands() {
-    local total=0
-
-    # Modern KDE Connect stores per-device plugin configs under:
-    #   ~/.config/kdeconnect/<device-id>/kdeconnect_runcommand/config
-    # Each file contains a [commands] group with numbered entries.
-    # We look across ALL paired devices.
-
-    while IFS= read -r -d '' cfg_file; do
-        local n
-        n=$(grep -c '^\[' "${cfg_file}" 2>/dev/null || true)
-        # Every command block starts with a section header, minus the
-        # leading [commands] section itself.
-        [[ $n -gt 0 ]] && n=$(( n - 1 ))
-        total=$(( total + n ))
-    done < <(find "${KDECONNECT_CFG_DIR}" -name "config" \
-                  -path "*/kdeconnect_runcommand/*" -print0 2>/dev/null)
-
-    echo "${total}"
+    python3 - "${KDECONNECT_CFG_DIR}" <<'PYEOF'
+import sys, os, glob, re, json
+kdir = sys.argv[1]
+total = 0
+for cfg in glob.glob(f"{kdir}/*/kdeconnect_runcommand/config"):
+    dev_names = set()
+    try:
+        with open(cfg, 'r', encoding='utf-8', errors='ignore') as f:
+            lines = f.readlines()
+        for line in lines:
+            line = line.strip()
+            if line.startswith("commands="):
+                raw = line[len("commands="):].strip()
+                if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
+                    raw = raw[1:-1].strip()
+                if raw.startswith("@ByteArray(") and raw.endswith(")"):
+                    raw = raw[len("@ByteArray("):-1].strip()
+                if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
+                    raw = raw[1:-1].strip()
+                if r'\"' in raw:
+                    raw = raw.replace(r'\"', '"')
+                try:
+                    data = json.loads(raw)
+                    if isinstance(data, str): data = json.loads(data)
+                    if isinstance(data, dict):
+                        for u, entry in data.items():
+                            if isinstance(entry, dict) and "name" in entry:
+                                dev_names.add(entry["name"])
+                except Exception:
+                    pass
+                break
+        in_commands = False
+        for line in lines:
+            line = line.strip()
+            if line == "[commands]": in_commands = True; continue
+            if in_commands and line.startswith("["): in_commands = False; continue
+            if in_commands and "=" in line:
+                k, v = line.split("=", 1)
+                if re.match(r'^cmd[0-9]+\\name$', k.strip()):
+                    dev_names.add(v.strip())
+    except Exception:
+        pass
+    total += len(dev_names)
+print(total)
+PYEOF
 }
 
 # ---------------------------------------------------------------------------
@@ -195,10 +222,19 @@ parse_run_stats() {
     }
 
     python3 - "${LOG_FILE}" <<'PYEOF'
-import sys, re
+import sys, re, os
 
-with open(sys.argv[1], 'r', errors='replace') as f:
-    content = f.read()
+log_path = sys.argv[1]
+try:
+    with open(log_path, 'rb') as f:
+        f.seek(0, os.SEEK_END)
+        size = f.tell()
+        # Read the tail (last 128KB) for fast parsing
+        seek_pos = max(0, size - 131072)
+        f.seek(seek_pos)
+        content = f.read().decode('utf-8', errors='replace')
+except Exception:
+    content = ""
 
 blocks = re.split(r'={8,}', content)
 
@@ -249,27 +285,71 @@ PYEOF
 # ---------------------------------------------------------------------------
 get_running_commands() {
     # Prints "name|script" (one per line) for every script currently running.
-    # Lightweight — reads config files directly without touching global arrays.
+    # Reads both @ByteArray JSON and legacy [commands] sections.
+    local running_raw
+    running_raw=$(python3 - "${KDECONNECT_CFG_DIR}" <<'PYEOF'
+import sys, os, glob, re, json, subprocess
 
-    while IFS= read -r -d '' cfg_file; do
-        local -A _n _c
-        _n=(); _c=()
-        while IFS='=' read -r k v; do
-            k="${k#"${k%%[![:space:]]*}"}"
-            if [[ "${k}" =~ ^(cmd[0-9]+)\\name$ ]];    then _n["${BASH_REMATCH[1]}"]="${v}"; fi
-            if [[ "${k}" =~ ^(cmd[0-9]+)\\command$ ]]; then _c["${BASH_REMATCH[1]}"]="${v}"; fi
-        done < <(awk '/^\[commands\]/{f=1;next} f && /^\[/{f=0} f{print}' \
-                     "${cfg_file}" 2>/dev/null)
+kdir = sys.argv[1]
+seen_cmds = {}
+for cfg in glob.glob(f"{kdir}/*/kdeconnect_runcommand/config"):
+    try:
+        with open(cfg, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+        for line in lines:
+            line = line.strip()
+            if line.startswith("commands="):
+                raw = line[len("commands="):].strip()
+                if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
+                    raw = raw[1:-1].strip()
+                if raw.startswith("@ByteArray(") and raw.endswith(")"):
+                    raw = raw[len("@ByteArray("):-1].strip()
+                if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
+                    raw = raw[1:-1].strip()
+                if r'\"' in raw:
+                    raw = raw.replace(r'\"', '"')
+                try:
+                    data = json.loads(raw)
+                    if isinstance(data, str): data = json.loads(data)
+                    if isinstance(data, dict):
+                        for u, entry in data.items():
+                            if isinstance(entry, dict):
+                                c_name = entry.get("name", "").strip()
+                                c_cmd = entry.get("command", "").strip()
+                                if c_name and c_cmd: seen_cmds[c_name] = c_cmd
+                except Exception:
+                    pass
+                break
+        in_commands = False
+        ini_names = {}; ini_cmds = {}
+        for line in lines:
+            line = line.strip()
+            if line == "[commands]": in_commands = True; continue
+            if in_commands and line.startswith("["): in_commands = False; continue
+            if in_commands and "=" in line:
+                k, v = line.split("=", 1)
+                k = k.strip(); v = v.strip()
+                m_name = re.match(r'^(cmd[0-9]+)\\name$', k)
+                m_cmd = re.match(r'^(cmd[0-9]+)\\command$', k)
+                if m_name: ini_names[m_name.group(1)] = v
+                elif m_cmd: ini_cmds[m_cmd.group(1)] = v
+        for k, c_name in ini_names.items():
+            if c_name not in seen_cmds and k in ini_cmds:
+                seen_cmds[c_name] = ini_cmds[k]
+    except Exception:
+        pass
 
-        for key in "${!_n[@]}"; do
-            local scr="${_c[$key]:-}"
-            [[ -z "${scr}" ]] && continue
-            if pgrep -f "${scr}" >/dev/null 2>&1; then
-                printf '%s|%s\n' "${_n[$key]}" "${scr}"
-            fi
-        done
-    done < <(find "${KDECONNECT_CFG_DIR}" -name "config" \
-                  -path "*/kdeconnect_runcommand/*" -print0 2>/dev/null)
+for name, script in seen_cmds.items():
+    scr_base = os.path.basename(script.split()[0]) if script else ""
+    if not scr_base: continue
+    res = subprocess.run(["pgrep", "-f", scr_base], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if res.returncode == 0:
+        print(f"{name}|{script}")
+PYEOF
+)
+    if [[ -n "${running_raw}" ]]; then
+        echo "${running_raw}"
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -486,22 +566,39 @@ pick_device_config_dir() {
                "${i}" "${dev_name}" "${dev_id}" >&2
         (( i++ ))
     done
+    if [[ ${#device_dirs[@]} -gt 1 ]]; then
+        printf "    ${YELLOW}[a]${RESET} %s\n" "${BOLD}All Paired Devices (${#device_dirs[@]})${RESET}" >&2
+    fi
 
     echo "" >&2
     local choice
     while true; do
-        read -rp "  Select device number [1-${#device_dirs[@]}]: " choice
+        read -rp "  Select device [1-${#device_dirs[@]}${CYAN}/a${RESET}]: " choice
+        if [[ "${choice,,}" == "a" || "${choice,,}" == "all" ]]; then
+            echo "ALL"
+            return 0
+        fi
         if [[ "${choice}" =~ ^[0-9]+$ ]] \
            && (( choice >= 1 && choice <= ${#device_dirs[@]} )); then
             break
         fi
-        echo -e "  ${RED}Invalid selection.${RESET} Please enter a number between 1 and ${#device_dirs[@]}." >&2
+        echo -e "  ${RED}Invalid selection.${RESET} Please enter a number between 1 and ${#device_dirs[@]} or 'a' for all." >&2
     done
 
     local selected_dir="${device_dirs[$(( choice - 1 ))]}"
     local plugin_dir="${selected_dir}/kdeconnect_runcommand"
     mkdir -p "${plugin_dir}"
     echo "${plugin_dir}"
+}
+
+get_all_paired_device_plugin_dirs() {
+    while IFS= read -r -d '' d; do
+        local bname="$(basename "${d}")"
+        if [[ -f "${d}/config" && "${bname}" != "backups" && ! "${bname}" =~ ^kdeconnect_ ]]; then
+            echo "${d}/kdeconnect_runcommand"
+        fi
+    done < <(find "${KDECONNECT_CFG_DIR}" -mindepth 1 -maxdepth 1 \
+                  -type d -not -name "." -print0 2>/dev/null)
 }
 
 # ---------------------------------------------------------------------------
@@ -810,39 +907,6 @@ create_command() {
     local plugin_dir
     plugin_dir=$(pick_device_config_dir) || { press_enter; return 1; }
 
-    local cfg_file="${plugin_dir}/config"
-    local cmd_key
-    cmd_key=$(next_command_key "${cfg_file}") || true
-    [[ -z "${cmd_key}" ]] && cmd_key="cmd0"
-
-    # Derive device name from parent directory name for display
-    local device_id device_name
-    device_id="$(basename "$(dirname "${plugin_dir}")")"
-    device_name="${device_id}"
-    local dev_cfg_file
-    dev_cfg_file="$(dirname "${plugin_dir}")/config"
-    if [[ -f "${dev_cfg_file}" ]]; then
-        device_name=$(grep -i '^name=' "${dev_cfg_file}" 2>/dev/null \
-                      | head -1 | cut -d'=' -f2- || echo "${device_id}")
-    fi
-
-    echo ""
-    echo -e "  ${DIM}Writing command '${cmd_name}' → ${cfg_file}${RESET}"
-
-    # 5. Write to plugin config (dual @ByteArray + INI format)
-    write_command_to_config "${cfg_file}" "${cmd_key}" "${cmd_name}" "${script_path}"
-
-    # 6. Update manual
-    if declare -F update_manual &>/dev/null; then
-        update_manual "${cmd_name}" "${script_path}" "${summary}" || true
-    fi
-
-    # 7. Log the action
-    if declare -F log_entry &>/dev/null; then
-        log_entry "CREATED command '${cmd_name}' | script='${script_path}' | device='${device_name}' | key='${cmd_key}'" || true
-    fi
-
-    # 8. Reload KDE Connect daemon and device runcommand plugin over D-Bus
     local qdbus_bin=""
     if command -v qdbus6 &>/dev/null; then
         qdbus_bin="qdbus6"
@@ -850,22 +914,80 @@ create_command() {
         qdbus_bin="qdbus"
     fi
 
-    if [[ -n "${qdbus_bin}" ]]; then
-        # Reload specific device plugin stack
-        if [[ -n "${device_id:-}" ]]; then
-            "${qdbus_bin}" org.kde.kdeconnect "/modules/kdeconnect/devices/${device_id}/runcommand" \
+    local -a target_plugin_dirs=()
+    local -a target_dev_names=()
+    local -a target_dev_ids=()
+
+    if [[ "${plugin_dir}" == "ALL" ]]; then
+        while IFS= read -r pdir; do
+            [[ -n "${pdir}" ]] || continue
+            target_plugin_dirs+=("${pdir}")
+            local did="$(basename "$(dirname "${pdir}")")"
+            target_dev_ids+=("${did}")
+            local dname="${did}"
+            local dcfg="$(dirname "${pdir}")/config"
+            if [[ -f "${dcfg}" ]]; then
+                dname=$(grep -i '^name=' "${dcfg}" 2>/dev/null | head -1 | cut -d'=' -f2- || echo "${did}")
+            fi
+            target_dev_names+=("${dname}")
+        done < <(get_all_paired_device_plugin_dirs)
+    else
+        target_plugin_dirs+=("${plugin_dir}")
+        local did="$(basename "$(dirname "${plugin_dir}")")"
+        target_dev_ids+=("${did}")
+        local dname="${did}"
+        local dcfg="$(dirname "${plugin_dir}")/config"
+        if [[ -f "${dcfg}" ]]; then
+            dname=$(grep -i '^name=' "${dcfg}" 2>/dev/null | head -1 | cut -d'=' -f2- || echo "${did}")
+        fi
+        target_dev_names+=("${dname}")
+    fi
+
+    local last_cfg=""
+    for (( ti=0; ti<${#target_plugin_dirs[@]}; ti++ )); do
+        local t_pdir="${target_plugin_dirs[$ti]}"
+        local t_dname="${target_dev_names[$ti]}"
+        local t_did="${target_dev_ids[$ti]}"
+        mkdir -p "${t_pdir}"
+        local t_cfg="${t_pdir}/config"
+        last_cfg="${t_cfg}"
+        local t_key
+        t_key=$(next_command_key "${t_cfg}") || true
+        [[ -z "${t_key}" ]] && t_key="cmd0"
+        echo ""
+        echo -e "  ${DIM}Writing command '${cmd_name}' → ${t_cfg}${RESET}"
+        write_command_to_config "${t_cfg}" "${t_key}" "${cmd_name}" "${script_path}"
+        if declare -F log_entry &>/dev/null; then
+            log_entry "CREATED command '${cmd_name}' | script='${script_path}' | device='${t_dname}' | key='${t_key}'" || true
+        fi
+        if [[ -n "${qdbus_bin}" && -n "${t_did}" ]]; then
+            "${qdbus_bin}" org.kde.kdeconnect "/modules/kdeconnect/devices/${t_did}/runcommand" \
                 org.kde.kdeconnect.device.runcommand.reload &>/dev/null || true
-            "${qdbus_bin}" org.kde.kdeconnect "/modules/kdeconnect/devices/${device_id}" \
+            "${qdbus_bin}" org.kde.kdeconnect "/modules/kdeconnect/devices/${t_did}" \
                 org.kde.kdeconnect.device.reloadPlugins &>/dev/null || true
         fi
-        # Broadcast network state change across all paired peers
+    done
+
+    # 6. Update manual
+    if declare -F update_manual &>/dev/null; then
+        update_manual "${cmd_name}" "${script_path}" "${summary}" || true
+    fi
+
+    if [[ -n "${qdbus_bin}" ]]; then
         "${qdbus_bin}" org.kde.kdeconnect /modules/kdeconnect \
             org.kde.kdeconnect.daemon.forceOnNetworkChange &>/dev/null || true
     fi
 
+    local disp_device
+    if [[ "${plugin_dir}" == "ALL" ]]; then
+        disp_device="All Paired Devices (${#target_plugin_dirs[@]})"
+    else
+        disp_device="${target_dev_names[0]}"
+    fi
+
     # 9. Display post-install summary
     show_summary "${cmd_name}" "${script_path}" "${summary}" \
-                 "${device_name}" "${cfg_file}"
+                 "${disp_device}" "${last_cfg}"
 }
 
 # ---------------------------------------------------------------------------
@@ -879,37 +1001,89 @@ collect_all_commands() {
     CMD_DEVICES=()
     CMD_CFGS=()
 
-    while IFS= read -r -d '' cfg_file; do
-        local plugin_dir device_dir dev_cfg dev_name
-        plugin_dir="$(dirname "${cfg_file}")"
-        device_dir="$(dirname "${plugin_dir}")"
-        dev_cfg="${device_dir}/config"
-        dev_name="$(basename "${device_dir}")"
-        if [[ -f "${dev_cfg}" ]]; then
-            dev_name=$(grep -i '^name=' "${dev_cfg}" 2>/dev/null \
-                       | head -1 | cut -d'=' -f2- || echo "${dev_name}")
-        fi
+    while IFS=$'\t' read -r _k _n _s _d _c; do
+        [[ -z "${_n}" ]] && continue
+        CMD_KEYS+=("${_k}")
+        CMD_NAMES+=("${_n}")
+        CMD_SCRIPTS+=("${_s}")
+        CMD_DEVICES+=("${_d}")
+        CMD_CFGS+=("${_c}")
+    done < <(python3 - "${KDECONNECT_CFG_DIR}" <<'PYEOF'
+import sys, os, glob, re, json
+kdir = sys.argv[1]
+rows = []
+for cfg in sorted(glob.glob(f"{kdir}/*/kdeconnect_runcommand/config")):
+    pdir = os.path.dirname(cfg)
+    ddir = os.path.dirname(pdir)
+    dcfg = os.path.join(ddir, "config")
+    dname = os.path.basename(ddir)
+    if os.path.isfile(dcfg):
+        try:
+            with open(dcfg, "r", encoding="utf-8", errors="ignore") as df:
+                for line in df:
+                    if line.startswith("name="):
+                        v = line.split("=", 1)[1].strip()
+                        if v: dname = v; break
+        except Exception:
+            pass
 
-        local -A _names _cmds
-        _names=()
-        _cmds=()
+    dev_cmds = {}
+    try:
+        with open(cfg, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+        for line in lines:
+            line = line.strip()
+            if line.startswith("commands="):
+                raw = line[len("commands="):].strip()
+                if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
+                    raw = raw[1:-1].strip()
+                if raw.startswith("@ByteArray(") and raw.endswith(")"):
+                    raw = raw[len("@ByteArray("):-1].strip()
+                if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
+                    raw = raw[1:-1].strip()
+                if r'\"' in raw:
+                    raw = raw.replace(r'\"', '"')
+                try:
+                    data = json.loads(raw)
+                    if isinstance(data, str): data = json.loads(data)
+                    if isinstance(data, dict):
+                        for u, entry in data.items():
+                            if isinstance(entry, dict):
+                                c_name = entry.get("name", "").strip()
+                                c_cmd = entry.get("command", "").strip()
+                                if c_name and c_cmd: dev_cmds[c_name] = (u, c_cmd)
+                except Exception:
+                    pass
+                break
 
-        while IFS='=' read -r k v; do
-            k="${k#"${k%%[![:space:]]*}"}"
-            if [[ "${k}" =~ ^(cmd[0-9]+)\\name$ ]];    then _names["${BASH_REMATCH[1]}"]="${v}"; fi
-            if [[ "${k}" =~ ^(cmd[0-9]+)\\command$ ]]; then _cmds["${BASH_REMATCH[1]}"]="${v}"; fi
-        done < <(awk '/^\[commands\]/{f=1;next} f && /^\[/{f=0} f{print}' \
-                     "${cfg_file}" 2>/dev/null)
+        in_commands = False
+        ini_names = {}; ini_cmds = {}
+        for line in lines:
+            line = line.strip()
+            if line == "[commands]": in_commands = True; continue
+            if in_commands and line.startswith("["): in_commands = False; continue
+            if in_commands and "=" in line:
+                k, v = line.split("=", 1)
+                k = k.strip(); v = v.strip()
+                m_name = re.match(r'^(cmd[0-9]+)\\name$', k)
+                m_cmd = re.match(r'^(cmd[0-9]+)\\command$', k)
+                if m_name: ini_names[m_name.group(1)] = v
+                elif m_cmd: ini_cmds[m_cmd.group(1)] = v
 
-        for key in $(echo "${!_names[@]}" | tr ' ' '\n' | sort); do
-            CMD_KEYS+=("${key}")
-            CMD_NAMES+=("${_names[$key]:-}")
-            CMD_SCRIPTS+=("${_cmds[$key]:-}")
-            CMD_DEVICES+=("${dev_name}")
-            CMD_CFGS+=("${cfg_file}")
-        done
-    done < <(find "${KDECONNECT_CFG_DIR}" -name "config" \
-                  -path "*/kdeconnect_runcommand/*" -print0 2>/dev/null)
+        for k, c_name in ini_names.items():
+            if c_name not in dev_cmds and k in ini_cmds:
+                dev_cmds[c_name] = (k, ini_cmds[k])
+
+        for c_name, (c_key, c_script) in sorted(dev_cmds.items()):
+            rows.append((c_key, c_name, c_script, dname, cfg))
+    except Exception:
+        pass
+
+for r in rows:
+    clean = [str(x).replace('\t', ' ').replace('\n', ' ') for x in r]
+    print('\t'.join(clean))
+PYEOF
+)
 }
 
 # ---------------------------------------------------------------------------
@@ -975,29 +1149,79 @@ PYEOF
 # ---------------------------------------------------------------------------
 remove_command_from_config() {
     local cfg="$1"
-    local key="$2"   # e.g. "cmd0"
+    local key="$2"   # e.g. "cmd0" or UUID
+    local name="${3:-}"
+    local script="${4:-}"
 
-    python3 - "${cfg}" "${key}" <<'PYEOF'
-import sys, re
+    python3 - "${cfg}" "${key}" "${name}" "${script}" <<'PYEOF'
+import sys, os, re, json
 
 cfg_path = sys.argv[1]
 key      = sys.argv[2]
+name     = sys.argv[3] if len(sys.argv) > 3 else ""
+script   = sys.argv[4] if len(sys.argv) > 4 else ""
 
-with open(cfg_path, 'r') as f:
-    content = f.read()
+if not os.path.isfile(cfg_path):
+    sys.exit(0)
 
-section_re = re.compile(r'(\[commands\])(.*?)(?=\n\[|\Z)', re.DOTALL | re.IGNORECASE)
-m = section_re.search(content)
+with open(cfg_path, 'r', encoding='utf-8', errors='ignore') as f:
+    lines = f.readlines()
 
-if m:
-    body = m.group(2)
-    body = re.sub(rf'^{re.escape(key)}\\name=.*\n?',    '', body, flags=re.MULTILINE)
-    body = re.sub(rf'^{re.escape(key)}\\command=.*\n?', '', body, flags=re.MULTILINE)
-    new_section = m.group(1) + body
-    content = content[:m.start()] + new_section + content[m.end():]
+# 1. Update @ByteArray in lines
+for idx, line in enumerate(lines):
+    l_strip = line.strip()
+    if l_strip.startswith("commands="):
+        raw = l_strip[len("commands="):].strip()
+        if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
+            raw = raw[1:-1].strip()
+        if raw.startswith("@ByteArray(") and raw.endswith(")"):
+            raw = raw[len("@ByteArray("):-1].strip()
+        if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
+            raw = raw[1:-1].strip()
+        if r'\"' in raw:
+            raw = raw.replace(r'\"', '"')
+        try:
+            data = json.loads(raw)
+            if isinstance(data, str): data = json.loads(data)
+            if isinstance(data, dict):
+                to_delete = []
+                for u, entry in data.items():
+                    if u == key:
+                        to_delete.append(u)
+                    elif isinstance(entry, dict):
+                        if (name and entry.get("name") == name) or (script and entry.get("command") == script):
+                            to_delete.append(u)
+                for u in to_delete:
+                    del data[u]
+                compact_json = json.dumps(data, separators=(',', ':'))
+                escaped_json = compact_json.replace('"', '\\"')
+                lines[idx] = f'commands="@ByteArray({escaped_json})"\n'
+        except Exception:
+            pass
+        break
 
-with open(cfg_path, 'w') as f:
-    f.write(content)
+# 2. Update legacy [commands] section
+new_lines = []
+in_commands = False
+for line in lines:
+    l_strip = line.strip()
+    if l_strip == "[commands]":
+        in_commands = True
+        new_lines.append(line)
+        continue
+    if in_commands and l_strip.startswith("["):
+        in_commands = False
+    if in_commands:
+        if key and (l_strip.startswith(f"{key}\\name=") or l_strip.startswith(f"{key}\\command=")):
+            continue
+        if name and re.match(rf'^cmd[0-9]+\\name={re.escape(name)}$', l_strip):
+            continue
+        if script and re.match(rf'^cmd[0-9]+\\command={re.escape(script)}$', l_strip):
+            continue
+    new_lines.append(line)
+
+with open(cfg_path, 'w', encoding='utf-8') as f:
+    f.writelines(new_lines)
 PYEOF
 }
 
@@ -1152,7 +1376,7 @@ view_installed_commands() {
 
             if [[ "${confirm,,}" == "yes" ]]; then
                 # 1. Remove from KDE config
-                remove_command_from_config "${r_cfg}" "${r_key}"
+                remove_command_from_config "${r_cfg}" "${r_key}" "${r_name}" "${r_script}"
 
                 # 2. Remove from manual
                 remove_from_manual "${r_name}"
@@ -1217,9 +1441,13 @@ view_log() {
     echo -e "${CYAN}║${RESET}  ${BOLD}${WHITE}Congen Log${RESET}  ${DIM}(Congen.log)${RESET}"
     echo -e "${CYAN}$(hr '═')${RESET}"
     echo ""
-    cat "${LOG_FILE}"
-    echo ""
-    press_enter
+    if [[ -t 1 ]] && command -v less &>/dev/null; then
+        less -R "${LOG_FILE}"
+    else
+        cat "${LOG_FILE}"
+        echo ""
+        press_enter
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -1427,17 +1655,33 @@ import_commands() {
         return
     }
 
-    local cfg_file="${plugin_dir}/config"
+    local -a target_plugin_dirs=()
+    local -a target_dev_names=()
+    local -a target_dev_ids=()
 
-    # Derive device name
-    local device_id device_name
-    device_id="$(basename "$(dirname "${plugin_dir}")")"
-    device_name="${device_id}"
-    local dev_cfg_file
-    dev_cfg_file="$(dirname "${plugin_dir}")/config"
-    if [[ -f "${dev_cfg_file}" ]]; then
-        device_name=$(grep -i '^name=' "${dev_cfg_file}" 2>/dev/null \
-                      | head -1 | cut -d'=' -f2- || echo "${device_id}")
+    if [[ "${plugin_dir}" == "ALL" ]]; then
+        while IFS= read -r pdir; do
+            [[ -n "${pdir}" ]] || continue
+            target_plugin_dirs+=("${pdir}")
+            local did="$(basename "$(dirname "${pdir}")")"
+            target_dev_ids+=("${did}")
+            local dname="${did}"
+            local dcfg="$(dirname "${pdir}")/config"
+            if [[ -f "${dcfg}" ]]; then
+                dname=$(grep -i '^name=' "${dcfg}" 2>/dev/null | head -1 | cut -d'=' -f2- || echo "${did}")
+            fi
+            target_dev_names+=("${dname}")
+        done < <(get_all_paired_device_plugin_dirs)
+    else
+        target_plugin_dirs+=("${plugin_dir}")
+        local did="$(basename "$(dirname "${plugin_dir}")")"
+        target_dev_ids+=("${did}")
+        local dname="${did}"
+        local dcfg="$(dirname "${plugin_dir}")/config"
+        if [[ -f "${dcfg}" ]]; then
+            dname=$(grep -i '^name=' "${dcfg}" 2>/dev/null | head -1 | cut -d'=' -f2- || echo "${did}")
+        fi
+        target_dev_names+=("${dname}")
     fi
 
     echo ""
@@ -1460,59 +1704,102 @@ import_commands() {
             continue
         fi
 
-        # Check if identical command already exists in target config
-        local already_exists=0
-        if [[ -f "${cfg_file}" ]]; then
-            while IFS= read -r existing_script; do
-                local clean_existing clean_imp
-                clean_existing=$(echo "${existing_script}" | sed -e 's/\\n//g' -e 's/\r//g' | xargs)
-                clean_imp=$(echo "${imp_script}" | sed -e 's/\\n//g' -e 's/\r//g' | xargs)
-                if [[ "${clean_existing}" == "${clean_imp}" ]]; then
-                    already_exists=1
-                    break
-                fi
-            done < <(grep -E '^cmd[0-9]+\\command=' "${cfg_file}" 2>/dev/null | cut -d'=' -f2- || true)
-        fi
+        local registered_any=0
+        for (( ti=0; ti<${#target_plugin_dirs[@]}; ti++ )); do
+            local cfg_file="${target_plugin_dirs[$ti]}/config"
+            local device_name="${target_dev_names[$ti]}"
+            mkdir -p "$(dirname "${cfg_file}")"
 
-        if (( already_exists == 1 )); then
+            # Check if identical command already exists in target config (ByteArray & INI)
+            local already_exists=0
+            if [[ -f "${cfg_file}" ]]; then
+                if grep -q "@ByteArray" "${cfg_file}" 2>/dev/null; then
+                    already_exists=$(python3 - "${cfg_file}" "${imp_name}" "${imp_script}" <<'PYEOF'
+import sys, json
+cfg_path, name, script = sys.argv[1], sys.argv[2], sys.argv[3]
+exists = 0
+try:
+    with open(cfg_path, 'r', encoding='utf-8', errors='ignore') as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith("commands="):
+                raw = line[len("commands="):].strip()
+                if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
+                    raw = raw[1:-1].strip()
+                if raw.startswith("@ByteArray(") and raw.endswith(")"):
+                    raw = raw[len("@ByteArray("):-1].strip()
+                if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
+                    raw = raw[1:-1].strip()
+                if r'\"' in raw:
+                    raw = raw.replace(r'\"', '"')
+                data = json.loads(raw)
+                if isinstance(data, str): data = json.loads(data)
+                if isinstance(data, dict):
+                    for u, entry in data.items():
+                        if isinstance(entry, dict):
+                            if entry.get("name") == name or entry.get("command") == script:
+                                exists = 1
+                                break
+                break
+except Exception:
+    pass
+print(exists)
+PYEOF
+)
+                fi
+                if [[ "${already_exists}" != "1" ]]; then
+                    while IFS= read -r existing_script; do
+                        local clean_existing clean_imp
+                        clean_existing=$(echo "${existing_script}" | sed -e 's/\\n//g' -e 's/\r//g' | xargs)
+                        clean_imp=$(echo "${imp_script}" | sed -e 's/\\n//g' -e 's/\r//g' | xargs)
+                        if [[ "${clean_existing}" == "${clean_imp}" ]]; then
+                            already_exists=1
+                            break
+                        fi
+                    done < <(grep -E '^cmd[0-9]+\\command=' "${cfg_file}" 2>/dev/null | cut -d'=' -f2- || true)
+                fi
+            fi
+
+            if (( already_exists == 1 )); then
+                continue
+            fi
+
+            # Get next available key
+            local cmd_key
+            cmd_key=$(next_command_key "${cfg_file}") || true
+            [[ -z "${cmd_key}" ]] && cmd_key="cmd0"
+
+            # Write to KDE config
+            write_command_to_config "${cfg_file}" "${cmd_key}" "${imp_name}" "${imp_script}" || true
+            registered_any=1
+
+            if declare -F log_entry &>/dev/null; then
+                log_entry "IMPORTED command '${imp_name}' | script='${imp_script}' | device='${device_name}' | key='${cmd_key}'" || true
+            fi
+        done
+
+        if (( registered_any == 1 )); then
+            # Write to manual (only if not already in it)
+            local existing_summary="—"
+            if declare -F lookup_summary_from_manual &>/dev/null; then
+                existing_summary=$(lookup_summary_from_manual "${imp_name}" 2>/dev/null || echo "—")
+            fi
+
+            if [[ "${existing_summary}" == "—" ]] && declare -F update_manual &>/dev/null; then
+                update_manual "${imp_name}" "${imp_script}" "${imp_summary:-Imported via Congen}" || true
+            fi
+
+            printf "    ${GREEN}✔${RESET}  Imported: ${BOLD}%s${RESET}\n" "${imp_name}"
+            imported_names+=("${imp_name}")
+            imported=$(( imported + 1 ))
+        else
             printf "    ${DIM}•  Already registered: %s (skipped)${RESET}\n" "${imp_name}"
             skipped=$(( skipped + 1 ))
             skipped_names+=("${imp_name} (already exists)")
-            continue
         fi
-
-        # Get next available key
-        local cmd_key
-        cmd_key=$(next_command_key "${cfg_file}") || true
-        if [[ -z "${cmd_key}" ]]; then
-            cmd_key="cmd$(( imported + 1 ))"
-        fi
-
-        # Write to KDE config
-        write_command_to_config "${cfg_file}" "${cmd_key}" "${imp_name}" "${imp_script}" || true
-
-        # Write to manual (only if not already in it)
-        local existing_summary="—"
-        if declare -F lookup_summary_from_manual &>/dev/null; then
-            existing_summary=$(lookup_summary_from_manual "${imp_name}" 2>/dev/null || echo "—")
-        fi
-
-        if [[ "${existing_summary}" == "—" ]] && declare -F update_manual &>/dev/null; then
-            update_manual "${imp_name}" "${imp_script}" "${imp_summary:-Imported via Congen}" || true
-        fi
-
-        if declare -F log_entry &>/dev/null; then
-            log_entry "IMPORTED command '${imp_name}' | script='${imp_script}' | device='${device_name}' | key='${cmd_key}'" || true
-        fi
-
-        printf "    ${GREEN}✔${RESET}  Imported: ${BOLD}%s${RESET} → %s\n" \
-               "${imp_name}" "${cmd_key}"
-
-        imported_names+=("${imp_name}")
-        imported=$(( imported + 1 ))
     done
 
-# Signal daemon / device to reload commands
+    # Signal daemon / device to reload commands
     local qdbus_bin=""
     if command -v qdbus6 &>/dev/null; then
         qdbus_bin="qdbus6"
@@ -1525,13 +1812,15 @@ import_commands() {
         "${qdbus_bin}" org.kde.kdeconnect /modules/kdeconnect \
             org.kde.kdeconnect.daemon.forceOnNetworkChange &>/dev/null || true
 
-        # 2. Targeted device plugin reload (reloads runcommand config immediately)
-        if [[ -n "${device_id:-}" ]]; then
-            "${qdbus_bin}" org.kde.kdeconnect "/modules/kdeconnect/devices/${device_id}" \
-                org.kde.kdeconnect.device.reloadPlugins &>/dev/null || true
-            "${qdbus_bin}" org.kde.kdeconnect "/modules/kdeconnect/devices/${device_id}/runcommand" \
-                org.kde.kdeconnect.device.runcommand.reload &>/dev/null || true
-        fi
+        # 2. Targeted device plugin reload
+        for did in "${target_dev_ids[@]}"; do
+            if [[ -n "${did}" ]]; then
+                "${qdbus_bin}" org.kde.kdeconnect "/modules/kdeconnect/devices/${did}" \
+                    org.kde.kdeconnect.device.reloadPlugins &>/dev/null || true
+                "${qdbus_bin}" org.kde.kdeconnect "/modules/kdeconnect/devices/${did}/runcommand" \
+                    org.kde.kdeconnect.device.runcommand.reload &>/dev/null || true
+            fi
+        done
     fi
 
     # Write summary to log
@@ -1913,8 +2202,9 @@ run_command_menu() {
         echo -e "  ${BOLD}Device   :${RESET} ${r_device}"
         echo ""
 
-        if [[ ! -f "${r_script}" ]]; then
-            echo -e "  ${RED}${BOLD}✘  ERROR:${RESET} Script file not found on disk:"
+        local target_bin="${r_script%% *}"
+        if [[ ! -f "${r_script}" && ! -f "${target_bin}" && ! -x "$(command -v "${target_bin}" 2>/dev/null)" ]]; then
+            echo -e "  ${RED}${BOLD}✘  ERROR:${RESET} Script or command not found on disk / PATH:"
             echo -e "  ${DIM}  ${r_script}${RESET}"
             echo ""
             log_entry "RUN FAILED (script not found) | command='${r_name}' | script='${r_script}'"
@@ -1933,7 +2223,7 @@ run_command_menu() {
             continue
         fi
 
-        if [[ ! -x "${r_script}" ]]; then
+        if [[ -f "${r_script}" && ! -x "${r_script}" ]]; then
             echo -e "  ${YELLOW}${BOLD}⚠  Script is not executable. Fixing now…${RESET}"
             chmod +x "${r_script}"
             echo -e "  ${GREEN}Done — executable bit set.${RESET}"
@@ -1961,7 +2251,11 @@ run_command_menu() {
         # Run the script; tee to temp file while displaying live output
         # Disable strict exit-on-error for the user script block
         set +e
-        bash "${r_script}" 2>&1 | tee "${tmp_out}"
+        if [[ -f "${r_script}" && -x "${r_script}" ]]; then
+            "${r_script}" 2>&1 | tee "${tmp_out}"
+        else
+            bash -c "${r_script}" 2>&1 | tee "${tmp_out}"
+        fi
         exit_code="${PIPESTATUS[0]}"
         set -e
 
@@ -2249,7 +2543,11 @@ schedule_create() {
             echo "_tmp=\$(mktemp /tmp/congen_sched_XXXXXX.log)"
             echo ""
             echo "set +e"
-            echo "bash '${cscript}' 2>&1 | tee \"\${_tmp}\""
+            echo "if [[ -f '${cscript}' && -x '${cscript}' ]]; then"
+            echo "    '${cscript}' 2>&1 | tee \"\${_tmp}\""
+            echo "else"
+            echo "    bash -c '${cscript}' 2>&1 | tee \"\${_tmp}\""
+            echo "fi"
             echo "_ec=\${PIPESTATUS[0]}"
             echo "set -e"
             echo ""
@@ -2680,17 +2978,55 @@ _last_refresh=0
 
 refresh_scripts() {
     _scripts=()
-    local cfg_file k v
-    while IFS= read -r -d '' cfg_file; do
-        while IFS='=' read -r k v; do
-            k="${k#"${k%%[![:space:]]*}"}"
-            if [[ "${k}" =~ \\command$ ]]; then
-                [[ -n "${v}" ]] && _scripts+=("${v}")
-            fi
-        done < <(awk '/^\[commands\]/{f=1;next} f&&/^\[/{f=0} f{print}' \
-                     "${cfg_file}" 2>/dev/null)
-    done < <(find "${KDECONNECT_CFG_DIR}" -name "config" \
-                  -path "*/kdeconnect_runcommand/*" -print0 2>/dev/null)
+    while IFS= read -r scr; do
+        [[ -n "${scr}" ]] && _scripts+=("${scr}")
+    done < <(python3 - "${KDECONNECT_CFG_DIR}" <<'PYEOF'
+import sys, os, glob, re, json
+kdir = sys.argv[1]
+found_scripts = set()
+for cfg in glob.glob(f"{kdir}/*/kdeconnect_runcommand/config"):
+    try:
+        with open(cfg, 'r', encoding='utf-8', errors='ignore') as f:
+            lines = f.readlines()
+        for line in lines:
+            line = line.strip()
+            if line.startswith("commands="):
+                raw = line[len("commands="):].strip()
+                if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
+                    raw = raw[1:-1].strip()
+                if raw.startswith("@ByteArray(") and raw.endswith(")"):
+                    raw = raw[len("@ByteArray("):-1].strip()
+                if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
+                    raw = raw[1:-1].strip()
+                if r'\"' in raw:
+                    raw = raw.replace(r'\"', '"')
+                try:
+                    data = json.loads(raw)
+                    if isinstance(data, str): data = json.loads(data)
+                    if isinstance(data, dict):
+                        for u, entry in data.items():
+                            if isinstance(entry, dict) and "command" in entry:
+                                cmd = entry["command"].strip()
+                                if cmd: found_scripts.add(cmd)
+                except Exception:
+                    pass
+                break
+        in_commands = False
+        for line in lines:
+            line = line.strip()
+            if line == "[commands]": in_commands = True; continue
+            if in_commands and line.startswith("["): in_commands = False; continue
+            if in_commands and "=" in line:
+                k, v = line.split("=", 1)
+                if re.match(r'^cmd[0-9]+\\command$', k.strip()):
+                    c = v.strip()
+                    if c: found_scripts.add(c)
+    except Exception:
+        pass
+for s in sorted(found_scripts):
+    print(s)
+PYEOF
+)
 }
 
 # ── Main polling loop ─────────────────────────────────────────────────────────
@@ -2713,6 +3049,8 @@ while true; do
     # Check each registered script for new running PIDs
     for scr in "${_scripts[@]:-}"; do
         [[ -z "${scr}" ]] && continue
+        local scr_base
+        scr_base="$(basename "${scr%% *}")"
         while IFS= read -r pid; do
             [[ -z "${pid}" ]] && continue
             if [[ -z "${_seen[${pid}]:-}" ]]; then
@@ -2725,7 +3063,7 @@ while true; do
                     "${pid}" \
                     "${scr}" >> "${LOG_FILE}"
             fi
-        done < <(pgrep -f "${scr}" 2>/dev/null || true)
+        done < <(pgrep -f "${scr_base}" 2>/dev/null || true)
     done
 
     # Keep seen-PID map bounded
@@ -2733,7 +3071,7 @@ while true; do
         unset _seen; declare -A _seen=()
     fi
 
-    sleep 1
+    sleep 0.25
 done
 DAEMON_EOF
 
@@ -3698,29 +4036,75 @@ PYEOF
         press_enter; return
     }
 
-    local cfg_file="${plugin_dir}/config"
-    local cmd_key
-    cmd_key=$(next_command_key "${cfg_file}")
+    local qdbus_bin=""
+    if command -v qdbus6 &>/dev/null; then
+        qdbus_bin="qdbus6"
+    elif command -v qdbus &>/dev/null; then
+        qdbus_bin="qdbus"
+    fi
 
-    write_command_to_config "${cfg_file}" "${cmd_key}" "${cmd_name}" "${script_path}"
-    update_manual "${cmd_name}" "${script_path}" "${cmd_summary}"
-    log_entry "SHORTCUT CMD | name='${cmd_name}' | shortcut='${norm_shortcut}' | session='${session_type}' | script='${script_path}' | key='${cmd_key}'"
+    local -a target_plugin_dirs=()
+    local -a target_dev_names=()
+    local -a target_dev_ids=()
 
-    # Signal daemon
-    for _qd in qdbus qdbus6; do
-        command -v "${_qd}" &>/dev/null && \
-        "${_qd}" org.kde.kdeconnect /modules/kdeconnect \
-                 org.kde.kdeconnect.daemon.refreshDiscovery 2>/dev/null || true
+    if [[ "${plugin_dir}" == "ALL" ]]; then
+        while IFS= read -r pdir; do
+            [[ -n "${pdir}" ]] || continue
+            target_plugin_dirs+=("${pdir}")
+            local did="$(basename "$(dirname "${pdir}")")"
+            target_dev_ids+=("${did}")
+            local dname="${did}"
+            local dcfg="$(dirname "${pdir}")/config"
+            if [[ -f "${dcfg}" ]]; then
+                dname=$(grep -i '^name=' "${dcfg}" 2>/dev/null | head -1 | cut -d'=' -f2- || echo "${did}")
+            fi
+            target_dev_names+=("${dname}")
+        done < <(get_all_paired_device_plugin_dirs)
+    else
+        target_plugin_dirs+=("${plugin_dir}")
+        local did="$(basename "$(dirname "${plugin_dir}")")"
+        target_dev_ids+=("${did}")
+        local dname="${did}"
+        local dcfg="$(dirname "${plugin_dir}")/config"
+        if [[ -f "${dcfg}" ]]; then
+            dname=$(grep -i '^name=' "${dcfg}" 2>/dev/null | head -1 | cut -d'=' -f2- || echo "${did}")
+        fi
+        target_dev_names+=("${dname}")
+    fi
+
+    local last_key="cmd0"
+    for (( ti=0; ti<${#target_plugin_dirs[@]}; ti++ )); do
+        local t_pdir="${target_plugin_dirs[$ti]}"
+        local t_dname="${target_dev_names[$ti]}"
+        local t_did="${target_dev_ids[$ti]}"
+        mkdir -p "${t_pdir}"
+        local t_cfg="${t_pdir}/config"
+        local t_key
+        t_key=$(next_command_key "${t_cfg}") || true
+        [[ -z "${t_key}" ]] && t_key="cmd0"
+        last_key="${t_key}"
+        write_command_to_config "${t_cfg}" "${t_key}" "${cmd_name}" "${script_path}"
+        log_entry "SHORTCUT CMD | name='${cmd_name}' | shortcut='${norm_shortcut}' | session='${session_type}' | script='${script_path}' | key='${t_key}'"
+        if [[ -n "${qdbus_bin}" && -n "${t_did}" ]]; then
+            "${qdbus_bin}" org.kde.kdeconnect "/modules/kdeconnect/devices/${t_did}/runcommand" \
+                org.kde.kdeconnect.device.runcommand.reload &>/dev/null || true
+            "${qdbus_bin}" org.kde.kdeconnect "/modules/kdeconnect/devices/${t_did}" \
+                org.kde.kdeconnect.device.reloadPlugins &>/dev/null || true
+        fi
     done
 
-    # ── Derive device name ────────────────────────────────────────────────────
-    local device_id device_name
-    device_id="$(basename "$(dirname "${plugin_dir}")")"
-    device_name="${device_id}"
-    local dev_cfg="${HOME}/.config/kdeconnect/${device_id}/config"
-    if [[ -f "${dev_cfg}" ]]; then
-        device_name=$(grep -i '^name=' "${dev_cfg}" 2>/dev/null \
-                      | head -1 | cut -d'=' -f2- || echo "${device_id}")
+    update_manual "${cmd_name}" "${script_path}" "${cmd_summary}"
+
+    if [[ -n "${qdbus_bin}" ]]; then
+        "${qdbus_bin}" org.kde.kdeconnect /modules/kdeconnect \
+            org.kde.kdeconnect.daemon.refreshDiscovery 2>/dev/null || true
+    fi
+
+    local disp_device
+    if [[ "${plugin_dir}" == "ALL" ]]; then
+        disp_device="All Paired Devices (${#target_plugin_dirs[@]})"
+    else
+        disp_device="${target_dev_names[0]}"
     fi
 
     # ── Final summary screen ──────────────────────────────────────────────────
@@ -3734,8 +4118,8 @@ PYEOF
     echo -e "  ${BOLD}Shortcut       :${RESET}  ${CYAN}${BOLD}${norm_shortcut}${RESET}"
     echo -e "  ${BOLD}Summary        :${RESET}  ${cmd_summary}"
     echo -e "  ${BOLD}Session Type   :${RESET}  ${session_type}"
-    echo -e "  ${BOLD}Registered To  :${RESET}  ${device_name}"
-    echo -e "  ${BOLD}Config Key     :${RESET}  ${cmd_key}"
+    echo -e "  ${BOLD}Registered To  :${RESET}  ${disp_device}"
+    echo -e "  ${BOLD}Config Key     :${RESET}  ${last_key}"
     echo ""
     echo -e "${CYAN}$(hr '─')${RESET}"
     echo -e "  ${BOLD}Script         :${RESET}"

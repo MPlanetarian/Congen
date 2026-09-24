@@ -34,17 +34,55 @@ _last_refresh=0
 
 refresh_scripts() {
     _scripts=()
-    local cfg_file k v
-    while IFS= read -r -d '' cfg_file; do
-        while IFS='=' read -r k v; do
-            k="${k#"${k%%[![:space:]]*}"}"
-            if [[ "${k}" =~ \\command$ ]]; then
-                [[ -n "${v}" ]] && _scripts+=("${v}")
-            fi
-        done < <(awk '/^\[commands\]/{f=1;next} f&&/^\[/{f=0} f{print}' \
-                     "${cfg_file}" 2>/dev/null)
-    done < <(find "${KDECONNECT_CFG_DIR}" -name "config" \
-                  -path "*/kdeconnect_runcommand/*" -print0 2>/dev/null)
+    while IFS= read -r scr; do
+        [[ -n "${scr}" ]] && _scripts+=("${scr}")
+    done < <(python3 - "${KDECONNECT_CFG_DIR}" <<'PYEOF'
+import sys, os, glob, re, json
+kdir = sys.argv[1]
+found_scripts = set()
+for cfg in glob.glob(f"{kdir}/*/kdeconnect_runcommand/config"):
+    try:
+        with open(cfg, 'r', encoding='utf-8', errors='ignore') as f:
+            lines = f.readlines()
+        for line in lines:
+            line = line.strip()
+            if line.startswith("commands="):
+                raw = line[len("commands="):].strip()
+                if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
+                    raw = raw[1:-1].strip()
+                if raw.startswith("@ByteArray(") and raw.endswith(")"):
+                    raw = raw[len("@ByteArray("):-1].strip()
+                if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
+                    raw = raw[1:-1].strip()
+                if r'\"' in raw:
+                    raw = raw.replace(r'\"', '"')
+                try:
+                    data = json.loads(raw)
+                    if isinstance(data, str): data = json.loads(data)
+                    if isinstance(data, dict):
+                        for u, entry in data.items():
+                            if isinstance(entry, dict) and "command" in entry:
+                                cmd = entry["command"].strip()
+                                if cmd: found_scripts.add(cmd)
+                except Exception:
+                    pass
+                break
+        in_commands = False
+        for line in lines:
+            line = line.strip()
+            if line == "[commands]": in_commands = True; continue
+            if in_commands and line.startswith("["): in_commands = False; continue
+            if in_commands and "=" in line:
+                k, v = line.split("=", 1)
+                if re.match(r'^cmd[0-9]+\\command$', k.strip()):
+                    c = v.strip()
+                    if c: found_scripts.add(c)
+    except Exception:
+        pass
+for s in sorted(found_scripts):
+    print(s)
+PYEOF
+)
 }
 
 # ── Main polling loop ─────────────────────────────────────────────────────────
@@ -67,6 +105,8 @@ while true; do
     # Check each registered script for new running PIDs
     for scr in "${_scripts[@]:-}"; do
         [[ -z "${scr}" ]] && continue
+        local scr_base
+        scr_base="$(basename "${scr%% *}")"
         while IFS= read -r pid; do
             [[ -z "${pid}" ]] && continue
             if [[ -z "${_seen[${pid}]:-}" ]]; then
@@ -79,7 +119,7 @@ while true; do
                     "${pid}" \
                     "${scr}" >> "${LOG_FILE}"
             fi
-        done < <(pgrep -f "${scr}" 2>/dev/null || true)
+        done < <(pgrep -f "${scr_base}" 2>/dev/null || true)
     done
 
     # Keep seen-PID map bounded
@@ -87,5 +127,5 @@ while true; do
         unset _seen; declare -A _seen=()
     fi
 
-    sleep 1
+    sleep 0.25
 done
